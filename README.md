@@ -204,8 +204,6 @@ and creates a restore Job only when a new generation is detected.
 status:
   lastBackupTime:
   lastBackupStatus:
-  successfulBackupJobs:
-  failedBackupJobs:
   activeBackupJobs:
 
   restoreStatus:
