@@ -1,136 +1,282 @@
-# backup-operator
-// TODO(user): Add simple overview of use/purpose
+# PostgreSQL Backup & Restore Operator
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+A Kubernetes Operator built using Kubebuilder and Go that automates PostgreSQL backup, retention management, and disaster recovery workflows inside Kubernetes.
 
-## Getting Started
+## Overview
 
-### Prerequisites
-- go version v1.24.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+Managing database backups is a critical operational responsibility in Kubernetes environments. While Kubernetes provides CronJobs and Jobs, configuring, maintaining, and recovering PostgreSQL backups manually can become repetitive and error-prone.
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
+The PostgreSQL Backup & Restore Operator automates the entire lifecycle of database protection:
 
-```sh
-make docker-build docker-push IMG=<some-registry>/backup-operator:tag
+* Scheduled PostgreSQL backups
+* Compressed backup storage
+* Backup retention management
+* Automatic cleanup of old backups
+* On-demand disaster recovery through restore jobs
+* Status tracking through Kubernetes Custom Resources
+
+The operator follows Kubernetes-native patterns using Custom Resources, CronJobs, Jobs, ConfigMaps, Secrets, and Persistent Volume Claims.
+
+---
+
+## Features
+
+### Automated Backups
+
+* Schedule PostgreSQL backups using cron expressions
+* Uses `pg_dump` for logical database backups
+* Stores compressed backups as `.sql.gz`
+
+### Backup Storage
+
+* Stores backups on a dedicated Persistent Volume Claim
+* Supports long-term backup retention
+
+### Retention Management
+
+* Automatically removes old backup files
+* Configurable retention period
+
+### Disaster Recovery
+
+* Trigger database restoration using generation-based requests
+* Restore from the most recent available backup
+* Uses PostgreSQL native restore workflow
+
+### Status Tracking
+
+Tracks:
+
+* Last backup execution
+* Backup success/failure status
+* Active backup jobs
+* Restore requests
+* Restore execution history
+
+---
+
+## Architecture
+
+```text
+                     BackupOperator CR
+                              |
+                              |
+                    +---------+---------+
+                    |                   |
+                    v                   v
+            Backup CronJob      Cleanup CronJob
+                    |                   |
+                    v                   |
+             PostgreSQL Backup          |
+             (pg_dump + gzip)           |
+                    |                   |
+                    +---------+---------+
+                              |
+                              v
+                       Backup Storage PVC
+                              |
+                              v
+                       Restore Job
+                              |
+                              v
+                     PostgreSQL Database
 ```
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+---
 
-**Install the CRDs into the cluster:**
+## Custom Resource Example
 
-```sh
-make install
+```yaml
+apiVersion: apps.dev.com/v1alpha1
+kind: BackupOperator
+
+metadata:
+  name: postgres-backup
+
+spec:
+  restoreGeneration: 0
+
+  targetPVC: postgres-pvc
+
+  schedule: "0 2 * * *"
+
+  backupImage: postgres:16
+
+  backupPath: backup-storage-pvc
+
+  retention: 2
 ```
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+---
 
-```sh
-make deploy IMG=<some-registry>/backup-operator:tag
+## CRD Fields
+
+| Field             | Description                                 |
+| ----------------- | ------------------------------------------- |
+| restoreGeneration | Generation-based restore trigger            |
+| targetPVC         | PostgreSQL data PVC                         |
+| schedule          | Backup schedule (Cron format)               |
+| backupImage       | Container image used for backup and restore |
+| backupPath        | PVC used to store backup files              |
+| retention         | Retention period for backups                |
+
+---
+
+## Backup Workflow
+
+1. Backup CronJob runs on the configured schedule.
+2. PostgreSQL credentials are loaded from ConfigMap and Secret.
+3. `pg_dump` creates a logical database backup.
+4. Backup is compressed using gzip.
+5. Backup file is stored on the backup PVC.
+6. Operator updates backup status.
+
+### Example Backup File
+
+```text
+postgres-backup-20260530-021500.sql.gz
 ```
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
+---
 
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
+## Cleanup Workflow
 
-```sh
-kubectl apply -k config/samples/
+1. Cleanup CronJob executes periodically.
+2. Backup files older than the configured retention period are identified.
+3. Expired backups are removed.
+4. Backup storage remains clean and manageable.
+
+---
+
+## Restore Workflow
+
+The operator uses a generation-based restore mechanism.
+
+Initial state:
+
+```yaml
+spec:
+  restoreGeneration: 0
 ```
 
->**NOTE**: Ensure that the samples has default values to test it out.
+To request a restore:
 
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
-
-```sh
-kubectl delete -k config/samples/
+```yaml
+spec:
+  restoreGeneration: 1
 ```
 
-**Delete the APIs(CRDs) from the cluster:**
+To request another restore later:
 
-```sh
-make uninstall
+```yaml
+spec:
+  restoreGeneration: 2
 ```
 
-**UnDeploy the controller from the cluster:**
+The operator compares:
 
-```sh
-make undeploy
+```text
+spec.restoreGeneration
 ```
 
-## Project Distribution
+against:
 
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/backup-operator:tag
+```text
+status.observedRestoreGeneration
 ```
 
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
+and creates a restore Job only when a new generation is detected.
 
-2. Using the installer
+### Restore Process
 
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
+1. User increments `restoreGeneration`
+2. Operator creates Restore Job
+3. Latest backup is identified
+4. Backup is decompressed
+5. SQL is restored using `psql`
+6. Restore status is updated
 
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/backup-operator/<tag or branch>/dist/install.yaml
+---
+
+## Status Example
+
+```yaml
+status:
+  lastBackupTime:
+  lastBackupStatus:
+  successfulBackupJobs:
+  failedBackupJobs:
+  activeBackupJobs:
+
+  restoreStatus:
+    observedRestoreGeneration:
+    lastRestoreTime:
+    restoreStatus:
 ```
 
-### By providing a Helm Chart
+---
 
-1. Build the chart using the optional helm plugin
+## Disaster Recovery Test
 
-```sh
-kubebuilder edit --plugins=helm/v2-alpha
-```
+The operator has been validated using the following workflow:
 
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
+1. Create PostgreSQL table and data
+2. Generate backup
+3. Delete table
+4. Trigger restore by incrementing `restoreGeneration`
+5. Verify table and data are restored successfully
 
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
+This confirms end-to-end backup and recovery functionality.
 
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
+---
 
-**NOTE:** Run `make help` for more information on all potential `make` targets
+## Technologies Used
 
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
+* Go
+* Kubernetes
+* Kubebuilder
+* controller-runtime
+* PostgreSQL
+* CronJobs
+* Jobs
+* ConfigMaps
+* Secrets
+* Persistent Volume Claims
+
+---
+
+## Learning Outcomes
+
+This project demonstrates:
+
+* Kubernetes Operator Development
+* Custom Resource Design
+* Reconciliation Loops
+* Status Management
+* CronJob Orchestration
+* Job Orchestration
+* PostgreSQL Backup & Recovery
+* Disaster Recovery Workflows
+* Watches and Predicates
+* Owner References
+* Kubernetes Storage Management
+* Generation-Based Operations
+
+---
+
+## Future Enhancements
+
+* Backup selection during restore
+* S3 / Object Storage support
+* Backup encryption
+* Backup checksum validation
+* Prometheus metrics
+* Webhook validation
+* Multi-database support
+* Scheduled restore testing
+
+---
 
 ## License
 
-Copyright 2026.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
-# k8s-postgres-backup-restore-operator
+Licensed under the Apache License 2.0.
